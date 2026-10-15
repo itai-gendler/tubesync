@@ -1240,7 +1240,7 @@ class RefreshFormatsBackoff(BackoffAlgorithm):
     def calculate(attempt: int) -> int:
         return 600 + (3600 * attempt)
 
-@db_task(priority=50, retries=15, backoff_class=RefreshFormatsBackoff, task_base=AttemptsTask, queue=Val(TaskQueue.LIMIT))
+@db_task(priority=50, retries=1, backoff_class=RefreshFormatsBackoff, task_base=AttemptsTask, queue=Val(TaskQueue.LIMIT))
 def refresh_formats(media_id):
     try:
         media = Media.objects.get(pk=media_id)
