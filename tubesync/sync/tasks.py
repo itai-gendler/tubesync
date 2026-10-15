@@ -869,7 +869,7 @@ def upgrade_media(media_id):
         download_media_file.call_local(str(media.pk), override=True)
 
 
-@db_task(delay=60, priority=60, retries=3, retry_delay=600, queue=Val(TaskQueue.LIMIT))
+@db_task(delay=60, priority=60, retries=5, retry_delay=1800, queue=Val(TaskQueue.LIMIT))
 def download_media_metadata(media_id):
     '''
         Downloads the metadata for a media item.
