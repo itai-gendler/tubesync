@@ -22,7 +22,7 @@ references:
 
 # Failed work is retried with growing delays
 
-TubeSync aims to be hands-free: a media item whose download fails has its formats refreshed up to fifteen times, waiting ten minutes plus one hour for each attempt so far, and each refresh that finds a matching format queues the download again. Metadata is retried three times ten minutes apart; thumbnails, channel images and Source checks retry with delays that grow with the fourth power of the attempt.
+TubeSync aims to be hands-free: a media item whose download fails has its formats refreshed up to fifteen times, waiting ten minutes plus one hour for each attempt so far, and each refresh that finds a matching format queues the download again. Metadata is retried five times thirty minutes apart; thumbnails, channel images and Source checks retry with delays that grow with the fourth power of the attempt.
 
 ## Rationale
 
