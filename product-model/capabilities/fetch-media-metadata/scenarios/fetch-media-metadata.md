@@ -39,4 +39,4 @@ The media item has its title, description, published time, duration and availabl
 
 ## Edge cases
 
-- A failed fetch is retried up to three times, ten minutes apart.
+- A failed fetch is retried up to five times, thirty minutes apart.
