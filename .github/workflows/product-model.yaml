@@ -238,6 +238,7 @@ jobs:
       contents: write # to push the catch-up branch
       pull-requests: write # to open the catch-up pull request
     env:
+      AGENT: ${{ needs.catch-up-plan.outputs.agent }}
       BASE_BRANCH: ${{ needs.catch-up-plan.outputs.branch }}
       HEAD: ${{ needs.catch-up-plan.outputs.head }}
     steps:
@@ -274,7 +275,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          branch="product-model/catch-up-${HEAD:0:12}"
+          branch="product-model/catch-up-${HEAD:0:12}-${AGENT}"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          printf '\n---\nProposed by the [product-model catch-up](%s) with %s. Review each change before merging.\n' \
+            "${run_url}" "$([ claude = "${AGENT}" ] && echo 'Claude Code' || echo 'Codex')" \
+            >> "${RUNNER_TEMP}/catch-up/description.md"
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git switch -c "${branch}"
