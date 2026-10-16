@@ -188,8 +188,9 @@ jobs:
           github_token: ${{ github.token }}
           prompt: ${{ steps.prompt.outputs.text }}
           claude_args: >-
+            --model claude-opus-5-5
             --max-turns 200
-            --allowedTools "Read,Grep,Glob,Skill,Edit(product-model/**),Write(product-model/**),Write(.pdd-catch-up.md),Bash(git log:*),Bash(git diff:*),Bash(git show:*),Bash(node:*),Bash(npx --yes pdd-toolkit:*)"
+            --allowedTools "Read,Grep,Glob,Skill,Edit(product-model/**),Edit(.pdd-catch-up.md),Write(product-model/**),Write(.pdd-catch-up.md),Bash(git log:*),Bash(git diff:*),Bash(git show:*),Bash(node:*),Bash(npx:*)"
 
       - name: Catch up with Codex
         if: ${{ 'codex' == env.AGENT }}
@@ -199,6 +200,8 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
           npm install --global @openai/codex
+          # Ubuntu 24.04 runners block the user namespaces the Codex sandbox uses
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           export CODEX_HOME="${RUNNER_TEMP}/codex-home"
           install -d -m 700 "${CODEX_HOME}"
           if [ -n "${CODEX_AUTH_JSON}" ]; then
@@ -222,6 +225,14 @@ jobs:
           cp .pdd-catch-up.md "${RUNNER_TEMP}/description.md"
           wc -l "${RUNNER_TEMP}/model.patch"
           cat "${RUNNER_TEMP}/description.md"
+      - name: Keep the agent transcript
+        if: ${{ always() && 'claude' == env.AGENT }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: transcript
+          path: ${{ runner.temp }}/claude-execution-output.json
+          retention-days: 7
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@v7
         with:
           name: catch-up
@@ -275,7 +286,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          branch="product-model/catch-up-${HEAD:0:12}-${AGENT}"
+          branch="product-model-catch-up/${HEAD:0:12}-${AGENT}"
           run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           printf '\n---\nProposed by the [product-model catch-up](%s) with %s. Review each change before merging.\n' \
             "${run_url}" "$([ claude = "${AGENT}" ] && echo 'Claude Code' || echo 'Codex')" \
