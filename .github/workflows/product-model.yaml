@@ -6,14 +6,6 @@ env:
 on:
   workflow_dispatch:
     inputs:
-      agent:
-        description: 'Agent for the catch-up'
-        type: choice
-        options:
-          - auto
-          - claude
-          - codex
-        default: auto
       since:
         description: 'Catch up from this commit (default: the last commit that changed product-model/)'
         type: string
@@ -63,40 +55,30 @@ jobs:
     permissions:
       contents: read # to fetch the repository content
     outputs:
-      agent: ${{ steps.agent.outputs.agent }}
+      ready: ${{ steps.secret.outputs.ready }}
       base: ${{ steps.changes.outputs.base }}
       head: ${{ steps.changes.outputs.head }}
       branch: ${{ steps.changes.outputs.branch }}
     steps:
-      - name: Choose an agent with a secret available
-        id: agent
+      - name: Check for the Claude secret
+        id: secret
         shell: bash
         env:
-          REQUESTED: ${{ inputs.agent || 'auto' }}
-          HAS_CLAUDE: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' || secrets.ANTHROPIC_API_KEY != '' }}
-          HAS_CODEX: ${{ secrets.CODEX_AUTH_JSON != '' || secrets.OPENAI_API_KEY != '' }}
+          HAS_SECRET: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' || secrets.ANTHROPIC_API_KEY != '' }}
         run: |
-          agent=''
-          case "${REQUESTED}" in
-            (claude) [ 'true' = "${HAS_CLAUDE}" ] && agent=claude ;;
-            (codex) [ 'true' = "${HAS_CODEX}" ] && agent=codex ;;
-            (*)
-              if [ 'true' = "${HAS_CLAUDE}" ]; then agent=claude
-              elif [ 'true' = "${HAS_CODEX}" ]; then agent=codex
-              fi ;;
-          esac
-          if [ -z "${agent}" ]; then
-            echo "::notice::No secret for the ${REQUESTED} catch-up agent; skipping the catch-up."
+          if [ 'true' = "${HAS_SECRET}" ]; then
+            printf 'ready=true\n' >> "${GITHUB_OUTPUT}"
+          else
+            echo "::notice::Neither CLAUDE_CODE_OAUTH_TOKEN nor ANTHROPIC_API_KEY is set; skipping the catch-up."
           fi
-          printf 'agent=%s\n' "${agent}" >> "${GITHUB_OUTPUT}"
       - uses: actions/checkout@v7
-        if: ${{ '' != steps.agent.outputs.agent }}
+        if: ${{ 'true' == steps.secret.outputs.ready }}
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
           fetch-depth: 0
       - name: Find what changed since the model
         id: changes
-        if: ${{ '' != steps.agent.outputs.agent }}
+        if: ${{ 'true' == steps.secret.outputs.ready }}
         shell: bash
         env:
           SINCE: ${{ inputs.since }}
@@ -119,13 +101,12 @@ jobs:
 
   catch-up:
     needs: ['catch-up-plan']
-    if: ${{ '' != needs.catch-up-plan.outputs.agent && '' != needs.catch-up-plan.outputs.base }}
+    if: ${{ 'true' == needs.catch-up-plan.outputs.ready && '' != needs.catch-up-plan.outputs.base }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
       contents: read # to fetch the repository content
     env:
-      AGENT: ${{ needs.catch-up-plan.outputs.agent }}
       BASE: ${{ needs.catch-up-plan.outputs.base }}
       HEAD: ${{ needs.catch-up-plan.outputs.head }}
     steps:
@@ -140,7 +121,7 @@ jobs:
       - name: Install the pdd-kit skills
         shell: bash
         run: |
-          npx --yes "pdd-toolkit@${PDD_TOOLKIT_VERSION}" install --providers "${AGENT}" --scope project
+          npx --yes "pdd-toolkit@${PDD_TOOLKIT_VERSION}" install --providers claude --scope project
           # cache the CLI the skill lints with, before the agent runs
           npx --yes "pdd-toolkit@${PDD_TOOLKIT_VERSION}" lint
       - name: Write the prompt
@@ -180,7 +161,6 @@ jobs:
           } >> "${GITHUB_OUTPUT}"
 
       - name: Catch up with Claude Code
-        if: ${{ 'claude' == env.AGENT }}
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -192,30 +172,6 @@ jobs:
             --max-turns 200
             --allowedTools "Read,Grep,Glob,Skill,Edit(product-model/**),Edit(.pdd-catch-up.md),Write(product-model/**),Write(.pdd-catch-up.md),Bash(git log:*),Bash(git diff:*),Bash(git show:*),Bash(node:*),Bash(npx:*)"
 
-      - name: Catch up with Codex
-        if: ${{ 'codex' == env.AGENT }}
-        shell: bash
-        env:
-          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: |
-          npm install --global @openai/codex
-          # Ubuntu 24.04 runners block the user namespaces the Codex sandbox uses
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          export CODEX_HOME="${RUNNER_TEMP}/codex-home"
-          install -d -m 700 "${CODEX_HOME}"
-          if [ -n "${CODEX_AUTH_JSON}" ]; then
-            ( umask 077; printf '%s' "${CODEX_AUTH_JSON}" > "${CODEX_HOME}/auth.json" )
-          else
-            export CODEX_API_KEY="${OPENAI_API_KEY}"
-          fi
-          unset CODEX_AUTH_JSON OPENAI_API_KEY
-          codex exec \
-            --sandbox workspace-write \
-            --config sandbox_workspace_write.network_access=true \
-            - < "${RUNNER_TEMP}/catch-up-prompt.md"
-          rm -f "${CODEX_HOME}/auth.json"
-
       - name: Keep only the model and the description
         shell: bash
         run: |
@@ -226,7 +182,7 @@ jobs:
           wc -l "${RUNNER_TEMP}/model.patch"
           cat "${RUNNER_TEMP}/description.md"
       - name: Keep the agent transcript
-        if: ${{ always() && 'claude' == env.AGENT }}
+        if: ${{ always() }}
         uses: actions/upload-artifact@v7
         with:
           name: transcript
@@ -249,7 +205,6 @@ jobs:
       contents: write # to push the catch-up branch
       pull-requests: write # to open the catch-up pull request
     env:
-      AGENT: ${{ needs.catch-up-plan.outputs.agent }}
       BASE_BRANCH: ${{ needs.catch-up-plan.outputs.branch }}
       HEAD: ${{ needs.catch-up-plan.outputs.head }}
     steps:
@@ -286,11 +241,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          branch="product-model-catch-up/${HEAD:0:12}-${AGENT}"
+          branch="product-model-catch-up/${HEAD:0:12}"
           run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          printf '\n---\nProposed by the [product-model catch-up](%s) with %s. Review each change before merging.\n' \
-            "${run_url}" "$([ claude = "${AGENT}" ] && echo 'Claude Code' || echo 'Codex')" \
-            >> "${RUNNER_TEMP}/catch-up/description.md"
+          printf '\n---\nProposed by the [product-model catch-up](%s) with Claude Code. Review each change before merging.\n' \
+            "${run_url}" >> "${RUNNER_TEMP}/catch-up/description.md"
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git switch -c "${branch}"
