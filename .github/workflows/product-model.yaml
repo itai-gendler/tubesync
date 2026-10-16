@@ -5,6 +5,11 @@ env:
 
 on:
   workflow_dispatch:
+    inputs:
+      since:
+        description: 'Catch up from this commit (default: the last commit that changed product-model/)'
+        type: string
+        required: false
   # weekly, just after the scheduled image build in CI
   workflow_run:
     workflows:
@@ -27,7 +32,7 @@ concurrency:
 
 jobs:
   lint:
-    if: ${{ 'workflow_run' != github.event_name || 'schedule' == github.event.workflow_run.event }}
+    if: ${{ 'pull_request' == github.event_name || ( 'workflow_run' == github.event_name && 'schedule' == github.event.workflow_run.event ) }}
     runs-on: ubuntu-slim
     timeout-minutes: 5
     permissions:
@@ -42,3 +47,211 @@ jobs:
           node-version: 22
       - name: Lint product-model/
         run: npx --yes "pdd-toolkit@${PDD_TOOLKIT_VERSION}" lint
+
+  catch-up-plan:
+    if: ${{ 'workflow_dispatch' == github.event_name || ( 'workflow_run' == github.event_name && 'schedule' == github.event.workflow_run.event ) }}
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    permissions:
+      contents: read # to fetch the repository content
+    outputs:
+      ready: ${{ steps.secret.outputs.ready }}
+      base: ${{ steps.changes.outputs.base }}
+      head: ${{ steps.changes.outputs.head }}
+      branch: ${{ steps.changes.outputs.branch }}
+    steps:
+      - name: Check for the Claude secret
+        id: secret
+        shell: bash
+        env:
+          HAS_SECRET: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' || secrets.ANTHROPIC_API_KEY != '' }}
+        run: |
+          if [ 'true' = "${HAS_SECRET}" ]; then
+            printf 'ready=true\n' >> "${GITHUB_OUTPUT}"
+          else
+            echo "::notice::Neither CLAUDE_CODE_OAUTH_TOKEN nor ANTHROPIC_API_KEY is set; skipping the catch-up."
+          fi
+      - uses: actions/checkout@v7
+        if: ${{ 'true' == steps.secret.outputs.ready }}
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0
+      - name: Find what changed since the model
+        id: changes
+        if: ${{ 'true' == steps.secret.outputs.ready }}
+        shell: bash
+        env:
+          SINCE: ${{ inputs.since }}
+          BRANCH: ${{ github.event.workflow_run.head_branch || github.ref_name }}
+        run: |
+          base="${SINCE:-$(git log -1 --format=%H -- product-model)}"
+          head="$(git rev-parse HEAD)"
+          changed="$(git diff --name-only "${base}" "${head}" -- . ':!product-model')"
+          if [ -z "${changed}" ]; then
+            echo "::notice::Nothing outside product-model/ changed since ${base}; no catch-up needed."
+            base=''
+          else
+            git log --format='%h %s' "${base}..${head}"
+          fi
+          {
+            printf 'base=%s\n' "${base}"
+            printf 'head=%s\n' "${head}"
+            printf 'branch=%s\n' "${BRANCH}"
+          } >> "${GITHUB_OUTPUT}"
+
+  catch-up:
+    needs: ['catch-up-plan']
+    if: ${{ 'true' == needs.catch-up-plan.outputs.ready && '' != needs.catch-up-plan.outputs.base }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read # to fetch the repository content
+    env:
+      BASE: ${{ needs.catch-up-plan.outputs.base }}
+      HEAD: ${{ needs.catch-up-plan.outputs.head }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.catch-up-plan.outputs.head }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Install the pdd-kit skills
+        shell: bash
+        run: |
+          npx --yes "pdd-toolkit@${PDD_TOOLKIT_VERSION}" install --providers claude --scope project
+          # cache the CLI the skill lints with, before the agent runs
+          npx --yes "pdd-toolkit@${PDD_TOOLKIT_VERSION}" lint
+      - name: Write the prompt
+        id: prompt
+        shell: bash
+        run: |
+          {
+            printf 'Use the pdd-verify skill to bring product-model/ up to date with the changes merged since commit %s, up to %s.\n\n' "${BASE}" "${HEAD}"
+            printf 'Commits:\n\n```text\n'
+            git log --format='%h %s' "${BASE}..${HEAD}"
+            printf '```\n\nScope: the modeled behavior these changed files touch:\n\n```text\n'
+            git diff --name-only "${BASE}" "${HEAD}" -- . ':!product-model'
+            printf '```\n\n'
+            cat <<'EOF'
+          Nobody is reachable during this run. A maintainer reviews your result as a pull request, and that review is the approval for every model change. So:
+
+          - When the commits show the change was intended (a feature, a fix, a removal or a revert), the merged code is right: write the smallest model change that matches it. Where a call is yours to make alone, follow the skill's rules for when no author is reachable.
+          - When the merged code contradicts the model and the commits don't explain why, or a Business Rule broke as a side effect, it may be a bug: do not change the model for it. Record it as a question for the maintainer.
+          - Behavior you cannot establish from source: do not guess. Record it.
+          - Change nothing outside product-model/, except the summary file below. Do not run the application, its tests, builds, migrations or package scripts. Do not stage or commit.
+          - Run the skill's final lint.
+
+          Finally, write the pull request description to .pdd-catch-up.md in the repository root, in plain Markdown:
+
+          1. "Model changes": one line per change, naming the model file and the commit(s) behind it.
+          2. "Questions for the maintainer": each contradiction you left unchanged, with the model's claim, what the code now does, and the commit and file.
+          3. "Could not verify", only if anything was left unverifiable.
+
+          If nothing needed to change and there are no questions, write only: No model changes needed.
+          EOF
+          } > "${RUNNER_TEMP}/catch-up-prompt.md"
+          cat "${RUNNER_TEMP}/catch-up-prompt.md"
+          {
+            printf 'text<<PROMPT_EOF\n'
+            cat "${RUNNER_TEMP}/catch-up-prompt.md"
+            printf 'PROMPT_EOF\n'
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Catch up with Claude Code
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ github.token }}
+          prompt: ${{ steps.prompt.outputs.text }}
+          claude_args: >-
+            --model claude-opus-5-5
+            --max-turns 200
+            --allowedTools "Read,Grep,Glob,Skill,Edit(product-model/**),Edit(.pdd-catch-up.md),Write(product-model/**),Write(.pdd-catch-up.md),Bash(git log:*),Bash(git diff:*),Bash(git show:*),Bash(node:*),Bash(npx:*)"
+
+      - name: Keep only the model and the description
+        shell: bash
+        run: |
+          git add --intent-to-add -- product-model
+          git diff --binary -- product-model > "${RUNNER_TEMP}/model.patch"
+          touch .pdd-catch-up.md
+          cp .pdd-catch-up.md "${RUNNER_TEMP}/description.md"
+          wc -l "${RUNNER_TEMP}/model.patch"
+          cat "${RUNNER_TEMP}/description.md"
+      - name: Keep the agent transcript
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: transcript
+          path: ${{ runner.temp }}/claude-execution-output.json
+          retention-days: 7
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v7
+        with:
+          name: catch-up
+          path: |
+            ${{ runner.temp }}/model.patch
+            ${{ runner.temp }}/description.md
+          retention-days: 7
+
+  catch-up-pr:
+    needs: ['catch-up-plan', 'catch-up']
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
+    permissions:
+      contents: write # to push the catch-up branch
+      pull-requests: write # to open the catch-up pull request
+    env:
+      BASE_BRANCH: ${{ needs.catch-up-plan.outputs.branch }}
+      HEAD: ${{ needs.catch-up-plan.outputs.head }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.catch-up-plan.outputs.head }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: catch-up
+          path: ${{ runner.temp }}/catch-up
+      - name: Apply the model changes
+        id: apply
+        shell: bash
+        run: |
+          patch="${RUNNER_TEMP}/catch-up/model.patch"
+          if [ -s "${patch}" ]; then
+            git apply --index "${patch}"
+            printf 'changed=true\n' >> "${GITHUB_OUTPUT}"
+          else
+            echo "::notice::No model changes."
+            cat "${RUNNER_TEMP}/catch-up/description.md"
+          fi
+      - uses: actions/setup-node@v7
+        if: ${{ 'true' == steps.apply.outputs.changed }}
+        with:
+          node-version: 22
+      # pull requests opened with the workflow token don't start the lint job
+      - name: Lint product-model/
+        if: ${{ 'true' == steps.apply.outputs.changed }}
+        run: npx --yes "pdd-toolkit@${PDD_TOOLKIT_VERSION}" lint
+      - name: Open the catch-up pull request
+        if: ${{ 'true' == steps.apply.outputs.changed }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          branch="product-model-catch-up/${HEAD:0:12}"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          printf '\n---\nProposed by the [product-model catch-up](%s) with Claude Code. Review each change before merging.\n' \
+            "${run_url}" >> "${RUNNER_TEMP}/catch-up/description.md"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -c "${branch}"
+          git commit -m "docs(product-model): catch up with changes up to ${HEAD:0:12}"
+          git push origin "${branch}"
+          gh pr create \
+            --base "${BASE_BRANCH}" \
+            --head "${branch}" \
+            --title "docs(product-model): catch up with changes up to ${HEAD:0:12}" \
+            --body-file "${RUNNER_TEMP}/catch-up/description.md"
